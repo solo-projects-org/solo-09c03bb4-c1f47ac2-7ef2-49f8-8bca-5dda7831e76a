@@ -4,8 +4,18 @@
 提供：
   GET/POST /oai                      OAI-PMH 接口（ListRecords 支持日期 + resumptionToken 分页）
   GET      /admin/state              查看令牌库与故障开关状态
-  POST     /admin/fail-next          令下一次使用 resumptionToken 的请求返回 badResumptionToken
+  POST     /admin/fail-next          为接下来的续页请求注入故障
+                                     ?mode=bad-token（默认）|cross-page|cursor-mismatch|no-records-match
+                                     ?times=N 连续影响 N 次续页请求（默认 1）
+  POST     /admin/cross-page         /admin/fail-next?mode=cross-page 的简写
   POST     /admin/reset              清除故障开关与过期令牌
+
+故障模式：
+  bad-token          下一次续页请求返回 badResumptionToken（令牌失效）
+  cross-page         下一次续页请求返回“别的请求的末页”：
+                     <request> 回显的是另一个 resumptionToken，cursor 也对不上
+  cursor-mismatch    回显与实际请求一致，但返回别的请求的末页（cursor 对不上）
+  no-records-match   下一次续页请求返回 noRecordsMatch
 
 环境变量：
   PAGE_SIZE   每页记录数，默认 10
@@ -41,6 +51,8 @@ PORT = int(os.environ.get("PORT", "8080"))
 TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "3600"))
 BASE_URL = os.environ.get("BASE_URL", f"http://oai-source:{PORT}/oai")
 
+FAULT_MODES = {"bad-token", "cross-page", "cursor-mismatch", "no-records-match"}
+
 
 def _build_records() -> list[dict]:
     """生成 27 条确定性的样例书目，其中 rec-013 为已删除记录。"""
@@ -67,12 +79,16 @@ RECORDS = _build_records()
 
 
 class TokenStore:
-    """resumptionToken 的内存存储，带 TTL 与故障注入开关。"""
+    """resumptionToken 的内存存储，带 TTL 与故障注入开关。
+
+    故障开关按“接下来 N 次续页请求”计数，便于演示串页后重抓成功，
+    以及重抓期间再次串页导致整批失败。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._tokens: dict[str, dict] = {}
-        self.fail_next_token = False
+        self._fail_queue: list[str] = []
 
     def create(self, *, ids: list[str], cursor: int, from_date: str | None,
                until_date: str | None) -> str:
@@ -88,7 +104,7 @@ class TokenStore:
         return token
 
     def consume(self, token: str) -> dict | None:
-        """取出令牌；故障开关打开时销毁令牌并返回 None（模拟令牌失效）。"""
+        """取出令牌；不存在或过期返回 None（模拟令牌失效）。"""
         with self._lock:
             state = self._tokens.get(token)
             if state is None:
@@ -97,19 +113,39 @@ class TokenStore:
                 datetime.now(timezone.utc).timestamp() - state["created_at"]
                 > TOKEN_TTL
             )
-            if self.fail_next_token or expired:
+            if expired:
                 self._tokens.pop(token, None)
-                self.fail_next_token = False
                 return None
             return dict(state)
 
-    def set_fail_next(self) -> None:
+    def destroy(self, token: str) -> None:
         with self._lock:
-            self.fail_next_token = True
+            self._tokens.pop(token, None)
+
+    def take_fault(self) -> str | None:
+        """若有待注入的续页故障，消耗一个并返回故障模式名。"""
+        with self._lock:
+            if not self._fail_queue:
+                return None
+            return self._fail_queue.pop(0)
+
+    @property
+    def fail_next_token(self) -> bool:
+        with self._lock:
+            return bool(self._fail_queue)
+
+    def set_fail_next(self, mode: str = "bad-token", times: int = 1) -> None:
+        """排队故障：mode 可用逗号分隔形成序列，如 "cross-page,bad-token"。"""
+        modes = [m.strip() for m in mode.split(",") if m.strip()]
+        if not modes:
+            modes = ["bad-token"]
+        with self._lock:
+            for index in range(max(1, times)):
+                self._fail_queue.append(modes[index % len(modes)])
 
     def reset(self) -> None:
         with self._lock:
-            self.fail_next_token = False
+            self._fail_queue.clear()
             self._tokens.clear()
 
     def snapshot(self) -> dict:
@@ -118,7 +154,8 @@ class TokenStore:
                 "page_size": PAGE_SIZE,
                 "record_count": len(RECORDS),
                 "active_tokens": len(self._tokens),
-                "fail_next_token": self.fail_next_token,
+                "fail_next_token": bool(self._fail_queue),
+                "fault_queue": list(self._fail_queue),
             }
 
 
@@ -199,6 +236,7 @@ def _parse_date(value: str | None) -> str | None:
 
 def _list_records(qs: dict) -> bytes:
     token_value = qs.get("resumptionToken", [None])[0]
+    fault = None
     if token_value is not None:
         # 续页请求：只允许 resumptionToken，日期/格式参数必须由令牌替代
         forbidden = [k for k in ("from", "until", "metadataPrefix", "set")
@@ -208,6 +246,20 @@ def _list_records(qs: dict) -> bytes:
                 {"verb": "ListRecords"},
                 "badArgument",
                 "resumptionToken 与 from/until/set/metadataPrefix 不能同时出现",
+            )
+        fault = TOKENS.take_fault()
+        if fault == "bad-token":
+            TOKENS.destroy(token_value)
+            return _error_response(
+                {"verb": "ListRecords", "resumptionToken": token_value},
+                "badResumptionToken",
+                "resumptionToken 已失效或不存在",
+            )
+        if fault == "no-records-match":
+            return _error_response(
+                {"verb": "ListRecords", "resumptionToken": token_value},
+                "noRecordsMatch",
+                "续页请求（模拟）返回 noRecordsMatch",
             )
         state = TOKENS.consume(token_value)
         if state is None:
@@ -220,6 +272,19 @@ def _list_records(qs: dict) -> bytes:
         cursor = state["cursor"]
         from_date, until_date = state["from"], state["until"]
         echo = {"verb": "ListRecords", "resumptionToken": token_value}
+        if fault == "cross-page":
+            # 模拟“缓存把别的请求的末页返回给本次续页”：
+            # 回显另一个令牌，内容也取自另一个请求（全量末页，cursor 对不上）
+            other_ids = [r["identifier"] for r in RECORDS]
+            ids = other_ids
+            cursor = len(other_ids) - min(PAGE_SIZE, len(other_ids))
+            echo = {"verb": "ListRecords", "resumptionToken": "faulty-cross-page"}
+        elif fault == "cursor-mismatch":
+            # 回显与实际请求一致，但分页位置落在别的请求上：
+            # 取另一个请求的末页位置；若恰好与本页位置相同则改用 0，
+            # 保证注入的故障一定能被“cursor 对不上”识别出来
+            other_cursor = len(ids) - min(PAGE_SIZE, len(ids))
+            cursor = 0 if other_cursor == cursor else other_cursor
     else:
         prefix = qs.get("metadataPrefix", [None])[0]
         if prefix != "oai_dc":
@@ -365,11 +430,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _query(self) -> dict:
         parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
         if self.command == "POST":
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length).decode("UTF-8") if length else ""
-            return parse_qs(raw, keep_blank_values=True), parsed.path
-        return parse_qs(parsed.query, keep_blank_values=True), parsed.path
+            # 管理端点支持把故障参数放在 URL 查询串或表单体里
+            for key, values in parse_qs(raw, keep_blank_values=True).items():
+                qs.setdefault(key, values)
+        return qs, parsed.path
 
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch()
@@ -393,9 +461,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(TOKENS.snapshot())
             return
         if path == "/admin/fail-next":
-            TOKENS.set_fail_next()
+            mode = (qs.get("mode", [None])[0] or "bad-token").strip()
+            modes = [m.strip() for m in mode.split(",") if m.strip()]
+            if not modes or any(m not in FAULT_MODES for m in modes):
+                self._send_json(
+                    {"ok": False, "message": f"未知故障模式：{mode}",
+                     "supported": sorted(FAULT_MODES)},
+                    400,
+                )
+                return
+            try:
+                times = int(qs.get("times", [None])[0] or 1)
+            except ValueError:
+                self._send_json(
+                    {"ok": False, "message": "times 必须是整数"}, 400
+                )
+                return
+            TOKENS.set_fail_next(mode=mode, times=times)
             self._send_json(
-                {"ok": True, "message": "下一次 resumptionToken 请求将返回 badResumptionToken"}
+                {"ok": True, "mode": mode, "times": max(1, times),
+                 "message": f"接下来 {max(1, times)} 次续页请求将按序注入故障"}
+            )
+            return
+        if path == "/admin/cross-page":
+            mode = (qs.get("mode", [None])[0] or "cross-page").strip()
+            if mode not in ("cross-page", "cursor-mismatch"):
+                mode = "cross-page"
+            try:
+                times = int(qs.get("times", [None])[0] or 1)
+            except ValueError:
+                times = 1
+            TOKENS.set_fail_next(mode=mode, times=times)
+            self._send_json(
+                {"ok": True, "mode": mode, "times": max(1, times),
+                 "message": f"接下来 {max(1, times)} 次续页请求将返回串页"}
             )
             return
         if path == "/admin/reset":

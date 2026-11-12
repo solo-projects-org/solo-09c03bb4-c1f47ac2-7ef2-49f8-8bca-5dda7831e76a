@@ -22,6 +22,16 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _http_post(url: str) -> dict:
+    """调用样例源的管理端点（故障注入/重置），不依赖 httpx。"""
+    import json
+    import urllib.request
+
+    req = urllib.request.Request(url, data=b"", method="POST")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("UTF-8"))
+
+
 @pytest.fixture()
 def oai_server(monkeypatch, tmp_path):
     """每个测试一个全新的样例 OAI 源（PAGE_SIZE=10）。"""
@@ -33,6 +43,10 @@ def oai_server(monkeypatch, tmp_path):
     monkeypatch.setattr(server_mod, "PAGE_SIZE", 10)
     monkeypatch.setattr(server_mod, "TOKEN_TTL", 3600)
     monkeypatch.setattr(server_mod, "TOKENS", server_mod.TokenStore())
+
+    # 样例源在响应中回显 BASE_URL；它按模块加载时的环境变量计算，这里
+    # 一并 patch 模块属性，让回显的 <request> 内容与本夹具的实际端点一致。
+    monkeypatch.setattr(server_mod, "BASE_URL", f"http://127.0.0.1:{port}/oai")
     httpd = ThreadingHTTPServer(("127.0.0.1", port), server_mod.Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

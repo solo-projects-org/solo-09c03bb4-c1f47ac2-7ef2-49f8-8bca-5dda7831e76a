@@ -10,11 +10,13 @@
 | 之后从上次成功采集的截止日接着采，起止日都包含 | `from` 留空时取 `harvest_progress.last_until` 作为起始日（含当天） |
 | OAI-PMH ListRecords 按日期拉取 oai_dc | 首请求 `verb=ListRecords&metadataPrefix=oai_dc&from=...&until=...` |
 | 续页用 resumptionToken 替代日期和格式参数 | 续页请求只带 `verb` + `resumptionToken`；样例源对混用参数返回 `badArgument` |
-| 令牌失效丢弃已取页，按原区间重抓一次 | 捕获 `badResumptionToken` 后清空已取页，用原始 from/until 重新拉取；只重抓一次 |
+| 逐页核对不是串页 | 每个成功页核对 `<request>` 回显参数与实际请求一致；有 `cursor` 时必须等于本轮此前收到的记录数（删除标记也计入）；不看 `completeListSize` 判断是否采完 |
+| 串页/令牌失效丢弃已取页，按原区间重抓 | 重抓时清空本轮内存页，用原始 from/until 重新拉取；两种故障**合计只重抓一次**，重抓仍逐页核对 |
+| 只有首请求 noRecordsMatch 才按空批推进 | 首请求无匹配 -> `fetched=0` 推进截止日；续页返回该错误 -> 整批失败，截止日不动 |
+| 重抓仍失败返回 502 且目录/截止日不变 | 501/502 响应说明原因，事务回滚，`harvest_runs` 记录 `failed` |
 | 按标识更新 SQLite 书目 | `bib_records.identifier` 主键 upsert，重复采集幂等 |
 | 遇删除标记就撤下 | header `status=deleted` 的记录置为 `withdrawn`（库中不存在则写墓碑） |
 | 整批采完才提交书目变更和截止日 | 单事务 `BEGIN IMMEDIATE`，全部页取完才写库并提交；异常整体回滚 |
-| 无匹配也推进截止日 | `noRecordsMatch` 不写书目，同事务推进 `last_until` |
 | Docker Compose 启动服务和本地分页样例源 | `docker compose up --build` 启动 `harvester-api` + `oai-source` |
 | Swagger 发起采集并查询目录和进度 | http://localhost:8000/docs |
 
@@ -30,8 +32,9 @@ app/                  FastAPI 采集服务
   Dockerfile
 sample-oai/           本地分页样例 OAI-PMH 源（纯标准库）
   server.py           27 条样例记录（rec-013 为删除记录），PAGE_SIZE=10，3 页
+                      另带串页/令牌失效/续页无匹配故障注入端点
   Dockerfile
-tests/                pytest 端到端测试（12 个用例）
+tests/                pytest 端到端测试（20 个用例，含串页/失效重抓与整体失败）
 scripts/              辅助脚本（故障回滚演示）
 docker-compose.yml
 ```
@@ -90,27 +93,54 @@ curl 'http://localhost:8000/api/v1/runs'                    # 采集运行历史
 
 ### 4. 无匹配也推进截止日
 
-对没有任何记录的区间发起采集，返回 `fetched=0` 且 `last_until` 照常推进。
+只有**本轮首请求**返回 `noRecordsMatch` 才按空批处理：返回 `fetched=0`，`last_until`
+照常推进。若是**续页**返回 `noRecordsMatch`，视为翻页故障之外的协议异常，整批失败
+（`502`），目录与截止日不变。
 
-## 令牌失效重抓的验证方法
+## 串页/令牌失效重抓的验证方法
 
 样例源提供故障注入端点：
 
 ```bash
-# 令下一次 resumptionToken 请求返回 badResumptionToken
-curl -X POST http://localhost:8080/admin/fail-next
+# 注入故障（mode 默认 bad-token；times 默认 1；mode 可用逗号分隔形成序列）
+curl -X POST 'http://localhost:8080/admin/fail-next?mode=cross-page&times=1'
+curl -X POST 'http://localhost:8080/admin/fail-next?mode=cross-page,bad-token&times=2'
 curl http://localhost:8080/admin/state
 
-# 全区间 27 条共 3 页：第 1 页取到后续页令牌失效 -> 丢弃该页 -> 原区间重抓成功
+# 简写：串页（cross-page 或 cursor-mismatch）
+curl -X POST 'http://localhost:8080/admin/cross-page?times=1'
+curl -X POST 'http://localhost:8080/admin/cross-page?mode=cursor-mismatch&times=1'
+```
+
+故障模式：
+
+| mode | 样例源行为 | 采集端如何识别 |
+| --- | --- | --- |
+| `bad-token` | 续页返回 `badResumptionToken` | 令牌失效 |
+| `cross-page` | 续页返回别的请求的末页，`<request>` 回显另一个令牌 | 回显参数与实际请求不一致 |
+| `cursor-mismatch` | 回显与实际请求一致，但分页位置落在别的请求上 | `cursor` ≠ 本轮已收记录数 |
+| `no-records-match` | 续页返回 `noRecordsMatch` | 续页不允许空批，整批失败 |
+
+验证流程（Swagger 或 curl）：
+
+```bash
+# A. 串页一次 -> 丢弃本轮已取页 -> 按原区间重抓成功
+curl -X POST 'http://localhost:8080/admin/cross-page?times=1'
 curl -X POST http://localhost:8000/api/v1/harvest \
   -H 'Content-Type: application/json' \
   -d '{"from": "2026-10-01", "until": "2026-10-27"}'
-# 响应中 retries=1；运行历史与服务日志可查
-curl -X POST http://localhost:8080/admin/reset   # 清除故障开关
-```
+# 响应 retries=1、pages=3、fetched=27；进度 last_until=2026-10-27
 
-若重抓过程中令牌**再次**失效（不可恢复），接口返回 `502`，本批所有书目变更回滚、
-截止日保持不变，`harvest_runs` 中记录一条 `failed` 历史——任何半批数据都不会进库。
+# B. 两种故障合计只重抓一次：重抓期间再次串页/失效 -> 502
+curl -X POST http://localhost:8080/admin/reset
+curl -X POST 'http://localhost:8080/admin/fail-next?mode=cross-page,bad-token&times=2'
+curl -X POST http://localhost:8000/api/v1/harvest \
+  -H 'Content-Type: application/json' \
+  -d '{"from": "2026-10-06", "until": "2026-10-27"}'
+# 返回 502 与原因；目录条数、last_until 均与失败前一致；harvest_runs 新增 failed
+
+curl -X POST http://localhost:8080/admin/reset   # 清除故障与令牌
+```
 
 ## 事务与一致性说明
 

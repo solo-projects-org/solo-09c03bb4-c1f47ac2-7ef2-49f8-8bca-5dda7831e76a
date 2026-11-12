@@ -2,10 +2,14 @@
 
 - 首次请求携带 from / until / metadataPrefix；
 - 续页请求只携带 resumptionToken，替代日期与格式参数；
-- 识别 OAI error 码，badResumptionToken / noRecordsMatch 交由上层决策。
+- 每个响应都核对回显的 <request> 参数与实际发出的请求一致；对不上即视为
+  “串页”（服务端把别的请求的末页/续页返回给了本次请求），抛出 pageMismatch；
+- 识别 OAI error 码，badResumptionToken / noRecordsMatch / pageMismatch
+  交由上层决策。
 """
 from __future__ import annotations
 
+import json
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
@@ -65,11 +69,43 @@ class OAIClient:
         except ET.ParseError as exc:
             raise OAIError("parseError", f"OAI 响应无法解析：{exc}") from exc
 
+        # 先识别 OAI error：错误响应按协议只回显 verb，不应参与成功页的回显核对
         error_el = root.find(f"{OAI_NS}error")
         if error_el is not None:
             code = error_el.get("code", "unknownError")
             raise OAIError(code, (error_el.text or "").strip())
+
+        # 成功页：回显的 <request> 参数必须与实际发出的请求逐一一致
+        self._verify_request_echo(root, params)
         return root
+
+    @staticmethod
+    def _verify_request_echo(root: ET.Element, sent: dict) -> None:
+        """核对响应 <request> 回显参数与实际发出的请求一致。
+
+        回显缺失、参数多出或值不一致都视为“串页”（响应属于别的请求），
+        抛出 pageMismatch；值按字符串比较，None 视为空值。
+        """
+        request_el = root.find(f"{OAI_NS}request")
+        if request_el is None:
+            raise OAIError(
+                "pageMismatch",
+                "响应缺少 <request> 元素，无法核对回显参数",
+            )
+        echoed = {
+            key: (value or "").strip()
+            for key, value in request_el.attrib.items()
+        }
+        sent_norm = {
+            key: ("" if value is None else str(value)) for key, value in sent.items()
+        }
+        if echoed != sent_norm:
+            raise OAIError(
+                "pageMismatch",
+                "响应回显的 request 参数与实际请求不一致："
+                f"期望 {json.dumps(sent_norm, ensure_ascii=False, sort_keys=True)}，"
+                f"回显 {json.dumps(echoed, ensure_ascii=False, sort_keys=True)}",
+            )
 
     def list_records_first(self, *, from_date: str | None,
                            until_date: str) -> OAIPage:

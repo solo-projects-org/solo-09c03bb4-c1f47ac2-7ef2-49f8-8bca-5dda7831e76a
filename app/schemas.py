@@ -33,7 +33,13 @@ class HarvestResponse(BaseModel):
     inserted: int
     updated: int
     withdrawn: int = Field(..., description="因删除标记撤下的记录数")
-    retries: int = Field(..., description="令牌失效后按原区间重抓的次数（0 或 1）")
+    retries: int = Field(
+        ...,
+        description=(
+            "因串页（请求回显/cursor 对不上）或续页令牌失效而丢弃本轮已取页、"
+            "按原区间重抓的次数（0 或 1，两种故障合计）"
+        ),
+    )
     run_id: int
     note: str | None = None
 
