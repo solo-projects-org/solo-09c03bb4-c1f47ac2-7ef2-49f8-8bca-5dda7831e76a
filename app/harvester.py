@@ -4,9 +4,15 @@
 1. 首次采集由调用方提供起始日；之后起始日取 harvest_progress.last_until
    （上次成功采集的截止日，含当天），实现无缝续采。
 2. ListRecords 按日期拉取 oai_dc，续页仅用 resumptionToken。
-3. resumptionToken 失效（badResumptionToken）时丢弃已取页，按原区间整体重抓一次。
-4. 所有页取完后，在单个 SQLite 事务内 upsert/撤下书目并推进截止日；
-   无匹配记录同样推进截止日。事务失败则整批回滚，进度不变。
+3. 逐页核对：每个成功页的 <request> 回显参数须与实际发出的请求一致；
+   有 cursor 时须等于本轮此前已收记录数（删除标记计入）。回显或位置
+   对不上即判串页（源站缓存张冠李戴）。completeListSize 不作采完依据。
+4. 串页或 resumptionToken 失效（badResumptionToken）时丢弃本轮已收页，
+   按原区间整体重抓；两种故障合计只重抓一次，重抓仍逐页核对。
+5. 每轮只有首请求返回 noRecordsMatch 才按空批推进截止日；续页返回该
+   错误则整批失败。
+6. 所有页取完后，在单个 SQLite 事务内 upsert/撤下书目并推进截止日；
+   事务失败则整批回滚，目录与进度不变。
 """
 from __future__ import annotations
 
@@ -16,16 +22,26 @@ import threading
 from dataclasses import dataclass
 
 from . import db
-from .oai_client import OAIClient, OAIError, OAIRecord
+from .oai_client import OAIClient, OAIError, OAIPage, OAIRecord
 
 logger = logging.getLogger("harvester")
 
 # 进程内互斥：同一时刻只允许一个采集任务，避免进度竞争
 _HARVEST_LOCK = threading.Lock()
 
+# 串页与令牌失效合计允许的重抓次数
+_MAX_RETRIES = 1
+
 
 class HarvestConflictError(RuntimeError):
     pass
+
+
+class PageMixupError(OAIError):
+    """串页：响应的 <request> 回显或 cursor 位置与本页实际请求不符。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("pageMixup", message)
 
 
 @dataclass
@@ -43,63 +59,94 @@ class HarvestSummary:
     note: str | None = None
 
 
+def _verify_page(page: OAIPage, *, sent_params: dict, expected_cursor: int,
+                 page_no: int) -> None:
+    """核对一个成功页，防源站缓存串页。
+
+    - <request> 回显参数须与本页实际发出的请求参数完全一致；
+    - 响应带 cursor 时，须等于本轮此前已收记录数（删除标记也计入）。
+    """
+    echo = page.request_params
+    if echo != sent_params:
+        raise PageMixupError(
+            f"第 {page_no} 页 <request> 回显与实际请求不符："
+            f"发出 {sent_params}，回显 {echo}"
+        )
+    if page.cursor is not None and page.cursor != expected_cursor:
+        raise PageMixupError(
+            f"第 {page_no} 页 cursor={page.cursor}，但本轮此前已收 "
+            f"{expected_cursor} 条记录（含删除标记），位置不符"
+        )
+
+
+def _fetch_round(client: OAIClient, from_date: str | None,
+                 until_date: str) -> tuple[list[OAIRecord], int]:
+    """抓完一轮（一个日期区间的全部页），逐页核对。返回 (全部记录, 页数)。"""
+    collected: list[OAIRecord] = []
+    pages = 0
+
+    sent = {"verb": "ListRecords", "metadataPrefix": "oai_dc"}
+    if from_date:
+        sent["from"] = from_date
+    sent["until"] = until_date
+    page = client.list_records_first(from_date=from_date, until_date=until_date)
+    pages += 1
+    _verify_page(page, sent_params=sent, expected_cursor=0, page_no=pages)
+    collected.extend(page.records)
+    token = page.resumption_token
+
+    while token:
+        sent = {"verb": "ListRecords", "resumptionToken": token}
+        try:
+            page = client.list_records_resume(token)
+        except OAIError as exc:
+            if exc.code == "noRecordsMatch":
+                # 续页不得返回空批：已收页面作废，整批失败（不重抓）
+                raise OAIError(
+                    "noRecordsMatchMidList",
+                    f"第 {pages + 1} 页（续页）返回 noRecordsMatch，"
+                    "本轮已收页面作废，整批失败",
+                ) from exc
+            raise
+        pages += 1
+        _verify_page(page, sent_params=sent,
+                     expected_cursor=len(collected), page_no=pages)
+        collected.extend(page.records)
+        token = page.resumption_token
+    return collected, pages
+
+
 def _fetch_full_window(client: OAIClient, from_date: str | None,
                        until_date: str) -> tuple[list[OAIRecord], int, int]:
     """完整拉取一个日期区间。
 
-    返回 (全部记录, 页数, 因 badResumptionToken 触发的重抓次数)。
-    令牌失效时丢弃已取页，按原区间重新开始，只重抓一次。
+    返回 (全部记录, 页数, 重抓次数)。串页或 badResumptionToken 时丢弃本轮
+    已收页面、按原区间重抓；两种故障合计只重抓一次，重抓仍逐页核对。
     """
     retries = 0
-
-    def _attempt() -> tuple[list[OAIRecord], int]:
-        nonlocal retries
-        collected: list[OAIRecord] = []
-        pages = 0
-        page = client.list_records_first(
-            from_date=from_date, until_date=until_date
-        )
-        pages += 1
-        collected.extend(page.records)
-        token = page.resumption_token
-
-        while token:
-            try:
-                page = client.list_records_resume(token)
-            except OAIError as exc:
-                if exc.code != "badResumptionToken":
-                    raise
-                # 令牌失效：本批已取页全部作废，按原区间重抓一次
-                retries += 1
-                logger.warning(
-                    "resumptionToken 失效，丢弃已取的 %d 页，按区间 %s~%s 重抓",
-                    pages, from_date, until_date,
+    while True:
+        try:
+            records, pages = _fetch_round(client, from_date, until_date)
+            return records, pages, retries
+        except OAIError as exc:
+            retryable = (
+                isinstance(exc, PageMixupError)
+                or exc.code == "badResumptionToken"
+            )
+            if not retryable:
+                raise
+            if retries >= _MAX_RETRIES:
+                logger.error(
+                    "重抓后仍发生故障（%s），放弃本批：%s", exc.code, exc.message
                 )
-                return _retry_once()
-            pages += 1
-            collected.extend(page.records)
-            token = page.resumption_token
-        return collected, pages
-
-    def _retry_once() -> tuple[list[OAIRecord], int]:
-        collected: list[OAIRecord] = []
-        pages = 0
-        page = client.list_records_first(
-            from_date=from_date, until_date=until_date
-        )
-        pages += 1
-        collected.extend(page.records)
-        token = page.resumption_token
-        while token:
-            # 重抓期间再次失效属于不可恢复错误，直接失败（不循环重试）
-            page = client.list_records_resume(token)
-            pages += 1
-            collected.extend(page.records)
-            token = page.resumption_token
-        return collected, pages
-
-    records, pages = _attempt()
-    return records, pages, retries
+                raise
+            retries += 1
+            logger.warning(
+                "采集故障（%s: %s），丢弃本轮已收页面，按原区间 %s~%s 重抓"
+                "（第 %d/%d 次）",
+                exc.code, exc.message, from_date, until_date,
+                retries, _MAX_RETRIES,
+            )
 
 
 def harvest(client: OAIClient, *, until_date: str,

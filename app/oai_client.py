@@ -2,6 +2,8 @@
 
 - 首次请求携带 from / until / metadataPrefix；
 - 续页请求只携带 resumptionToken，替代日期与格式参数；
+- 解析响应 <request> 元素的回显参数与 resumptionToken 的 cursor 属性，
+  供采集端逐页核对（防源站缓存串页）；completeListSize 仅透传，不作采完依据；
 - 识别 OAI error 码，badResumptionToken / noRecordsMatch 交由上层决策。
 """
 from __future__ import annotations
@@ -38,6 +40,8 @@ class OAIPage:
     resumption_token: str | None
     complete_list_size: int | None
     cursor: int | None
+    # <request> 元素回显的请求参数（属性 -> 值），供采集端逐页核对防串页
+    request_params: dict = field(default_factory=dict)
 
 
 class OAIClient:
@@ -92,6 +96,11 @@ class OAIClient:
         if list_el is None:
             raise OAIError("parseError", "响应缺少 ListRecords 元素")
 
+        request_el = root.find(f"{OAI_NS}request")
+        request_params = (
+            dict(request_el.attrib) if request_el is not None else {}
+        )
+
         records: list[OAIRecord] = []
         for rec_el in list_el.findall(f"{OAI_NS}record"):
             header = rec_el.find(f"{OAI_NS}header")
@@ -139,6 +148,7 @@ class OAIClient:
             resumption_token=token,
             complete_list_size=complete_size,
             cursor=cursor,
+            request_params=request_params,
         )
 
 

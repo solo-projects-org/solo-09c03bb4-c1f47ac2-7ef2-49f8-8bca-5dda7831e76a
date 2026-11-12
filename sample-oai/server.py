@@ -5,6 +5,7 @@
   GET/POST /oai                      OAI-PMH 接口（ListRecords 支持日期 + resumptionToken 分页）
   GET      /admin/state              查看令牌库与故障开关状态
   POST     /admin/fail-next          令下一次使用 resumptionToken 的请求返回 badResumptionToken
+  POST     /admin/mix-next?times=N   令接下来 N 次续页请求返回“别的请求”的末页（模拟源站缓存串页）
   POST     /admin/reset              清除故障开关与过期令牌
 
 环境变量：
@@ -73,6 +74,7 @@ class TokenStore:
         self._lock = threading.Lock()
         self._tokens: dict[str, dict] = {}
         self.fail_next_token = False
+        self.mix_next_remaining = 0
 
     def create(self, *, ids: list[str], cursor: int, from_date: str | None,
                until_date: str | None) -> str:
@@ -107,9 +109,23 @@ class TokenStore:
         with self._lock:
             self.fail_next_token = True
 
+    def set_mix_next(self, times: int = 1) -> None:
+        """打开串页开关：接下来 times 次续页请求返回别的请求的末页。"""
+        with self._lock:
+            self.mix_next_remaining = max(0, times)
+
+    def should_mix(self) -> bool:
+        """续页请求到来时询问是否串页；是则消耗一次串页额度。"""
+        with self._lock:
+            if self.mix_next_remaining > 0:
+                self.mix_next_remaining -= 1
+                return True
+            return False
+
     def reset(self) -> None:
         with self._lock:
             self.fail_next_token = False
+            self.mix_next_remaining = 0
             self._tokens.clear()
 
     def snapshot(self) -> dict:
@@ -119,6 +135,7 @@ class TokenStore:
                 "record_count": len(RECORDS),
                 "active_tokens": len(self._tokens),
                 "fail_next_token": self.fail_next_token,
+                "mix_next_remaining": self.mix_next_remaining,
             }
 
 
@@ -190,6 +207,36 @@ def _filter_records(from_date: str | None, until_date: str | None) -> list[dict]
     return result
 
 
+# 串页故障注入：模拟源站缓存里“别的请求”的查询区间（与本馆补采区间不同）
+MIXUP_FOREIGN_WINDOW = ("2026-10-08", "2026-10-14")
+MIXUP_FOREIGN_TOKEN = "foreign-cached-request-token"
+
+
+def _foreign_last_page() -> bytes:
+    """构造“别的请求”的末页响应，模拟源站缓存把别的请求的结果回给续页请求。
+
+    - 记录来自另一个日期区间（MIXUP_FOREIGN_WINDOW）；
+    - <request> 回显的是别的请求的 resumptionToken；
+    - cursor 是别的列表的末页位置，与本批已收记录数对不上；
+    - 末页 resumptionToken 为空：不做逐页核对的采集端会误以为已采完，
+      从而少采书目却照常推进截止日。
+    """
+    from_date, until_date = MIXUP_FOREIGN_WINDOW
+    foreign = _filter_records(from_date, until_date)
+    cursor = max(0, len(foreign) - PAGE_SIZE)
+    root = _envelope(
+        {"verb": "ListRecords", "resumptionToken": MIXUP_FOREIGN_TOKEN}
+    )
+    list_el = ET.SubElement(root, f"{{{OAI_NS}}}ListRecords")
+    for record in foreign[cursor:]:
+        _record_element(list_el, record)
+    ET.SubElement(
+        list_el, f"{{{OAI_NS}}}resumptionToken",
+        {"completeListSize": str(len(foreign)), "cursor": str(cursor)},
+    )
+    return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+
 def _parse_date(value: str | None) -> str | None:
     if not value:
         return None
@@ -209,6 +256,9 @@ def _list_records(qs: dict) -> bytes:
                 "badArgument",
                 "resumptionToken 与 from/until/set/metadataPrefix 不能同时出现",
             )
+        if TOKENS.should_mix():
+            # 串页故障：缓存把别的请求的末页回给了本次续页请求
+            return _foreign_last_page()
         state = TOKENS.consume(token_value)
         if state is None:
             return _error_response(
@@ -365,11 +415,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _query(self) -> dict:
         parsed = urlparse(self.path)
+        # URL 查询串与 POST 表单体都接受，合并后同键以表单体为准
+        qs = parse_qs(parsed.query, keep_blank_values=True)
         if self.command == "POST":
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length).decode("UTF-8") if length else ""
-            return parse_qs(raw, keep_blank_values=True), parsed.path
-        return parse_qs(parsed.query, keep_blank_values=True), parsed.path
+            qs.update(parse_qs(raw, keep_blank_values=True))
+        return qs, parsed.path
 
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch()
@@ -396,6 +448,17 @@ class Handler(BaseHTTPRequestHandler):
             TOKENS.set_fail_next()
             self._send_json(
                 {"ok": True, "message": "下一次 resumptionToken 请求将返回 badResumptionToken"}
+            )
+            return
+        if path == "/admin/mix-next":
+            try:
+                times = int(qs.get("times", ["1"])[0] or "1")
+            except ValueError:
+                times = 1
+            TOKENS.set_mix_next(times)
+            self._send_json(
+                {"ok": True,
+                 "message": f"接下来 {times} 次 resumptionToken 请求将返回别的请求的末页（串页）"}
             )
             return
         if path == "/admin/reset":

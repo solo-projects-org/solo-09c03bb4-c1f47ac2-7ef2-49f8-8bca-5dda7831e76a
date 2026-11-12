@@ -20,6 +20,13 @@ class FlakyClient(OAIClient):
             resumption_token="token-a",
             complete_list_size=27,
             cursor=0,
+            # 回显与实际请求一致，才能通过逐页核对进入续页流程
+            request_params={
+                "verb": "ListRecords",
+                "metadataPrefix": "oai_dc",
+                "from": from_date,
+                "until": until_date,
+            },
         )
 
     def list_records_resume(self, token):

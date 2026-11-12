@@ -34,8 +34,12 @@ app = FastAPI(
     description=(
         "通过 OAI-PMH ListRecords(oai_dc) 按日期补采单馆书目。\n\n"
         "- 首次采集另填起始日；之后从上次成功采集的截止日（含当天）续采\n"
-        "- 续页只用 resumptionToken；令牌失效则丢弃已取页、按原区间重抓一次\n"
-        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日"
+        "- 续页只用 resumptionToken；逐页核对 <request> 回显与 cursor 位置，"
+        "防源站缓存串页\n"
+        "- 串页或令牌失效则丢弃本轮已收页、按原区间重抓（两种故障合计仅一次）\n"
+        "- 仅每轮首请求的 noRecordsMatch 按空批推进；续页返回该错误整批失败\n"
+        "- 整批采完才在一个事务内提交书目变更和截止日；失败则 502，目录与"
+        "截止日不变"
     ),
     version="1.0.0",
     lifespan=lifespan,
